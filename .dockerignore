@@ -1,0 +1,15 @@
+.git
+.venv
+.env
+.env.*
+__pycache__
+.pytest_cache
+*.db
+*.sqlite*
+tmp
+output
+materials
+docs/imported-chat
+docs/PROJECT_CONTEXT.md
+docs/RELEASE_STATUS.md
+tests

@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest==8.4.2
+pytest-asyncio==1.4.0
+pypdf==6.18.1
