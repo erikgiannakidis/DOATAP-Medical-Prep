@@ -4,7 +4,7 @@ import json
 import random
 from pathlib import Path
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from .db import init_db, make_engine, make_session_factory
@@ -136,6 +136,46 @@ class BotService:
             return [{"discipline": discipline, "count": count} for discipline, count in rows]
 
     @staticmethod
+    def _attempt_totals(user_id: int):
+        """All saved answers count, including unfinished and abandoned sessions."""
+        return (select(
+            Answer.question_id.label("question_id"),
+            func.max(Answer.id).label("latest_id"),
+            func.count(Answer.id).label("attempt_count"),
+        ).join(PracticeSession, PracticeSession.id == Answer.session_id)
+          .where(PracticeSession.user_id == user_id)
+          .group_by(Answer.question_id).subquery())
+
+    def progress(self, user_id: int) -> dict:
+        """Coverage and latest outcomes for the current READY bank, per user."""
+        fields = ("total", "answered_unique", "remaining", "latest_correct",
+                  "latest_wrong", "latest_unverified", "total_attempts")
+        overall = dict.fromkeys(fields, 0)
+        subjects = {}
+        with self.session_factory() as db:
+            self._user(db, user_id)
+            attempts = self._attempt_totals(user_id)
+            rows = db.execute(select(
+                Question.discipline, attempts.c.attempt_count, Answer.verified, Answer.correct,
+            ).outerjoin(attempts, attempts.c.question_id == Question.id)
+             .outerjoin(Answer, Answer.id == attempts.c.latest_id)
+             .where(Question.status == "READY").order_by(Question.discipline))
+            for discipline, count, verified, correct in rows:
+                subject = subjects.setdefault(discipline, {"discipline": discipline,
+                                                           **dict.fromkeys(fields, 0)})
+                for metrics in (overall, subject):
+                    metrics["total"] += 1
+                    if not count:
+                        metrics["remaining"] += 1
+                        continue
+                    metrics["answered_unique"] += 1
+                    metrics["total_attempts"] += count
+                    bucket = ("latest_unverified" if not verified else
+                              "latest_correct" if correct else "latest_wrong")
+                    metrics[bucket] += 1
+        return {**overall, "disciplines": list(subjects.values())}
+
+    @staticmethod
     def _user(db: Session, user_id: int) -> User:
         user = db.get(User, user_id)
         if user is None:
@@ -185,18 +225,51 @@ class BotService:
             if not available:
                 raise ValueError("No ready questions for this discipline")
             selected = random.SystemRandom().sample(available, min(count, len(available)))
-            db.execute(update(PracticeSession).where(
-                PracticeSession.user_id == user_id, PracticeSession.status == "ACTIVE"
-            ).values(status="ABANDONED", completed_at=utcnow()))
-            session = PracticeSession(user_id=user_id, discipline=discipline,
-                                      requested_count=count, total=len(selected))
-            db.add(session)
-            db.flush()
-            for position, question in enumerate(selected):
-                db.add(SessionQuestion(session_id=session.id, question_id=question.id,
-                                       position=position, snapshot=_question_dict(question)))
-            db.flush()
-            return self._session_dict(db, session)
+            return self._create_session(db, user_id, discipline, count, selected)
+
+    def _create_session(self, db: Session, user_id: int, discipline: str,
+                        count: int, selected: list[Question]) -> dict:
+        db.execute(update(PracticeSession).where(
+            PracticeSession.user_id == user_id, PracticeSession.status == "ACTIVE"
+        ).values(status="ABANDONED", completed_at=utcnow()))
+        session = PracticeSession(user_id=user_id, discipline=discipline,
+                                  requested_count=count, total=len(selected))
+        db.add(session)
+        db.flush()
+        for position, question in enumerate(selected):
+            db.add(SessionQuestion(session_id=session.id, question_id=question.id,
+                                   position=position, snapshot=_question_dict(question)))
+        db.flush()
+        return self._session_dict(db, session)
+
+    def start_study_session(self, user_id: int, discipline: str | None = None,
+                            count: int = 25) -> dict | None:
+        """Take the next unseen questions; assignment alone never marks one seen.
+
+        Source pages are ordered within documents, with stable IDs breaking ties
+        on the same page. Exhaustion leaves an existing session untouched.
+        """
+        if type(count) is not int or not 1 <= count <= 50:
+            raise ValueError("Study session size must be between 1 and 50")
+        if discipline == "ALL":
+            discipline = None
+        with self.session_factory.begin() as db:
+            self._user(db, user_id)
+            db.execute(select(User.id).where(User.id == user_id).with_for_update())
+            answered = (select(Answer.question_id)
+                        .join(PracticeSession, PracticeSession.id == Answer.session_id)
+                        .where(PracticeSession.user_id == user_id))
+            query = select(Question).where(Question.status == "READY", ~Question.id.in_(answered))
+            if discipline is not None:
+                query = query.where(Question.discipline == discipline)
+            selected = list(db.scalars(query.order_by(
+                Question.source_document.asc().nulls_last(),
+                Question.source_year.asc().nulls_last(),
+                Question.source_page.asc().nulls_last(), Question.id,
+            ).limit(count)))
+            if not selected:
+                return None
+            return self._create_session(db, user_id, discipline or "ALL", count, selected)
 
     def resume_session(self, user_id: int) -> dict | None:
         with self.session_factory() as db:
@@ -303,6 +376,77 @@ class BotService:
                 PracticeSession.user_id == user_id, PracticeSession.status != "ACTIVE"
             ).order_by(PracticeSession.id.desc()).limit(limit))
             return [self._summary(db, session) for session in sessions]
+
+    @staticmethod
+    def _page(total: int, page: int, page_size: int) -> dict:
+        if type(page) is not int or page < 0 or type(page_size) is not int or not 1 <= page_size <= 100:
+            raise ValueError("Page must be nonnegative and page size between 1 and 100")
+        pages = max(1, (total + page_size - 1) // page_size)
+        return {"total": total, "page": min(page, pages - 1), "page_size": page_size, "pages": pages}
+
+    @staticmethod
+    def _answer_item(answer: Answer, snapshot: dict, attempt_count: int) -> dict:
+        return {
+            "id": answer.question_id, "question_id": answer.question_id,
+            "answer_id": answer.id, "session_id": answer.session_id,
+            "attempt_count": attempt_count, "selected_option": answer.option,
+            "verified": answer.verified, "correct": answer.correct,
+            "answer_status": snapshot["answer_status"],
+            "correct_option": snapshot["correct_option"] if answer.verified else None,
+            "answered_at": answer.created_at.isoformat(), "snapshot": snapshot,
+        }
+
+    def question_history(self, user_id: int, discipline: str | None = None,
+                         page: int = 0, page_size: int = 10) -> dict:
+        """One latest answer per question, with an immutable historical snapshot.
+
+        Old questions remain available even if the current bank quarantines them.
+        Discipline filtering uses the latest attempt's question snapshot.
+        """
+        with self.session_factory() as db:
+            self._user(db, user_id)
+            attempts = self._attempt_totals(user_id)
+            query = (select(Answer, SessionQuestion.snapshot, attempts.c.attempt_count)
+                     .join(attempts, Answer.id == attempts.c.latest_id)
+                     .join(SessionQuestion, and_(
+                         SessionQuestion.session_id == Answer.session_id,
+                         SessionQuestion.question_id == Answer.question_id)))
+            if discipline not in {None, "ALL"}:
+                query = query.where(SessionQuestion.snapshot["discipline"].as_string() == discipline)
+            total = db.scalar(select(func.count()).select_from(query.subquery()))
+            pagination = self._page(total, page, page_size)
+            rows = db.execute(query.order_by(Answer.id.desc()).offset(
+                pagination["page"] * page_size).limit(page_size))
+            return {**pagination, "items": [self._answer_item(*row) for row in rows]}
+
+    def question_attempts(self, user_id: int, question_id: str,
+                          page: int = 0, page_size: int = 10) -> dict:
+        """Every saved attempt for one question; never expose another user's data."""
+        with self.session_factory() as db:
+            self._user(db, user_id)
+            query = (select(Answer, SessionQuestion.snapshot)
+                     .join(PracticeSession, PracticeSession.id == Answer.session_id)
+                     .join(SessionQuestion, and_(
+                         SessionQuestion.session_id == Answer.session_id,
+                         SessionQuestion.question_id == Answer.question_id))
+                     .where(PracticeSession.user_id == user_id, Answer.question_id == question_id))
+            total = db.scalar(select(func.count()).select_from(query.subquery()))
+            pagination = self._page(total, page, page_size)
+            rows = db.execute(query.order_by(Answer.id.desc()).offset(
+                pagination["page"] * page_size).limit(page_size))
+            return {**pagination, "items": [self._answer_item(answer, snapshot, total)
+                                             for answer, snapshot in rows]}
+
+    def session_history(self, user_id: int, page: int = 0, page_size: int = 10) -> dict:
+        with self.session_factory() as db:
+            self._user(db, user_id)
+            query = select(PracticeSession).where(
+                PracticeSession.user_id == user_id, PracticeSession.status != "ACTIVE")
+            total = db.scalar(select(func.count()).select_from(query.subquery()))
+            pagination = self._page(total, page, page_size)
+            sessions = db.scalars(query.order_by(PracticeSession.id.desc()).offset(
+                pagination["page"] * page_size).limit(page_size))
+            return {**pagination, "items": [self._summary(db, session) for session in sessions]}
 
     def toggle_favorite(self, user_id: int, question_id: str) -> bool:
         with self.session_factory.begin() as db:

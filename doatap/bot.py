@@ -11,6 +11,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from .i18n import LANGUAGES, translate as t
+from .translation import translation_links
 
 LOGGER = logging.getLogger(__name__)
 SUBJECTS = ("ANATOMY", "PHYSIOLOGY", "PHARMACOLOGY")
@@ -79,6 +80,31 @@ def result_text(summary: dict[str, Any], language: str) -> str:
     else:
         text += "\n\n" + t(language, "no_score")
     return text
+
+
+def feedback_text(feedback: dict[str, Any], language: str) -> str:
+    """A key can be shown only when it belonged to this verified attempt."""
+    if (feedback["verified"] and type(feedback.get("correct_option")) is int
+            and type(feedback.get("correct")) is bool):
+        return t(language, "correct" if feedback["correct"] else "incorrect",
+                 answer=chr(65 + feedback["correct_option"]), status=feedback["answer_status"])
+    return t(language, "unverified")
+
+
+def answer_marker(attempt: dict[str, Any]) -> str:
+    if not attempt["verified"] or attempt.get("correct") is None:
+        return "?"
+    return "✓" if attempt["correct"] else "✗"
+
+
+def pagination(language: str, page: dict[str, Any], *prefix: object,
+               previous: str = "previous", more: str = "more") -> list[list[InlineKeyboardButton]]:
+    row = []
+    if page["page"] > 0:
+        row.append(button(t(language, previous), *prefix, page["page"] - 1))
+    if page["page"] + 1 < page["pages"]:
+        row.append(button(t(language, more), *prefix, page["page"] + 1))
+    return [row] if row else []
 
 
 def split_message(text: str, limit: int = 3500) -> list[str]:
@@ -159,9 +185,10 @@ class BotUI:
         rows = []
         if active:
             rows.append([button(t(lang, "resume", **active), "continue", active["id"])])
-        rows.extend([[button(t(lang, "quick"), "quick")],
-                     [button(t(lang, "history"), "history"), button(t(lang, "favorites"), "favorites", 0)],
-                     [button(t(lang, "language"), "language")]])
+        rows.extend([[button(t(lang, "study"), "bank")],
+                     [button(t(lang, "quick"), "quick")],
+                     [button(t(lang, "my_progress"), "progress"), button(t(lang, "history"), "history")],
+                     [button(t(lang, "favorites"), "favorites", 0), button(t(lang, "language"), "language")]])
         await self.render(update, (notice + "\n\n" if notice else "") + t(lang, "home"), rows)
 
     async def show_subjects(self, update: Update, language: str) -> None:
@@ -170,6 +197,48 @@ class BotUI:
                 for subject in SUBJECTS]
         rows.append([button(t(language, "menu"), "menu")])
         await self.render(update, t(language, "subject"), rows)
+
+    async def show_bank(self, update: Update, user: dict[str, Any]) -> None:
+        lang = user["language"]
+        progress = self.service.progress(user["id"])
+        counts = {entry["discipline"]: entry for entry in progress["disciplines"]}
+        rows = [[button(t(lang, "study_scope", subject=t(lang, "ALL"), remaining=progress["remaining"]),
+                        "study", "ALL")]]
+        for subject in SUBJECTS:
+            rows.append([button(t(lang, "study_scope", subject=t(lang, subject),
+                                  remaining=counts.get(subject, {}).get("remaining", 0)), "study", subject)])
+        rows.extend([[button(t(lang, "my_progress"), "progress")], [button(t(lang, "menu"), "menu")]])
+        await self.render(update, t(lang, "study_intro"), rows)
+
+    async def start_study(self, update: Update, user: dict[str, Any], scope: str, *,
+                          replace=False, expected_session_id: int | None = None) -> None:
+        uid, lang = user["id"], user["language"]
+        progress = self.service.progress(uid)
+        selected = progress if scope == "ALL" else next(
+            (entry for entry in progress["disciplines"] if entry["discipline"] == scope),
+            {"total": 0, "remaining": 0})
+        if not selected["remaining"]:
+            text = t(lang, "study_done", subject=t(lang, scope)) if selected["total"] else t(lang, "unavailable")
+            await self.render(update, text, [[button(t(lang, "my_progress"), "progress")],
+                                              [button(t(lang, "menu"), "menu")]])
+            return
+        active = self.service.resume_session(uid)
+        if replace and (not active or active["id"] != expected_session_id):
+            if not active:
+                await self.show_menu(update, user, t(lang, "stale"))
+                return
+            replace = False
+        if active and not replace:
+            await self.render(update, t(lang, "study_replace", **active), [
+                [button(t(lang, "resume", **active), "continue", active["id"])],
+                [button(t(lang, "study_start"), "study_replace", scope, active["id"])],
+                [button(t(lang, "menu"), "menu")]])
+            return
+        session = self.service.start_study_session(uid, discipline=scope, count=25)
+        if session is None:
+            await self.show_menu(update, user, t(lang, "study_done", subject=t(lang, scope)))
+        else:
+            await self.show_question(update, user, session["id"])
 
     async def show_question(self, update: Update, user: dict[str, Any], session_id: int) -> None:
         uid, lang = user["id"], user["language"]
@@ -183,13 +252,14 @@ class BotUI:
             await self.show_result(update, user, session_id)
             return
         qid = question["id"]
-        header = t(lang, "question", subject=t(lang, session["discipline"]),
+        header = t(lang, "question", subject=t(lang, question["discipline"]),
                    number=session["answered"] + 1, total=session["total"])
         saved = any(item["id"] == qid for item in self.service.favorites(uid))
         answers = [button(chr(65 + index), "answer", session_id, qid, index)
                    for index in range(len(question["options"]))]
         rows = [answers[index:index + 5] for index in range(0, len(answers), 5)]
         rows.extend([[button(t(lang, "favorite_remove" if saved else "favorite_add"), "save", session_id, qid)],
+                     [button(t(lang, "translate"), "trq", session_id, qid)],
                      [button(t(lang, "menu"), "menu")]])
         await self.render(update, header + "\n\n" + question_text(question, lang), rows)
 
@@ -198,16 +268,104 @@ class BotUI:
         rows = []
         if summary["status"] == "ACTIVE":
             rows.append([button(t(user["language"], "resume", **summary), "continue", session_id)])
+        else:
+            rows.append([button(t(user["language"], "study_next"), "study", summary["discipline"])])
+        rows.append([button(t(user["language"], "my_progress"), "progress")])
         rows.append([button(t(user["language"], "menu"), "menu")])
         await self.render(update, result_text(summary, user["language"]), rows)
 
     async def show_history(self, update: Update, user: dict[str, Any]) -> None:
+        # Preserve already-sent "history" callbacks while expanding the view.
+        await self.show_progress(update, user)
+
+    async def show_progress(self, update: Update, user: dict[str, Any]) -> None:
+        uid, lang = user["id"], user["language"]
+        progress = self.service.progress(uid)
+        lines = [t(lang, "coverage", **progress), ""]
+        rows = []
+        active = self.service.resume_session(uid)
+        if active:
+            rows.append([button(t(lang, "resume", **active), "continue", active["id"])])
+        if progress["remaining"]:
+            rows.append([button(t(lang, "study_start"), "study", "ALL")])
+        rows.append([button(t(lang, "answer_history"), "ql", "ALL", 0)])
+        for entry in progress["disciplines"]:
+            if entry["discipline"] not in SUBJECTS:
+                continue
+            label = t(lang, "coverage_subject", subject=t(lang, entry["discipline"]), **entry)
+            lines.append(label)
+            rows.append([button(label, "ql", entry["discipline"], 0)])
+        lines.extend(["", t(lang, "coverage_note")])
+        rows.extend([[button(t(lang, "session_history"), "sessions", 0)],
+                     [button(t(lang, "menu"), "menu")]])
+        await self.render(update, "\n".join(lines), rows)
+
+    async def show_sessions(self, update: Update, user: dict[str, Any], page: int = 0) -> None:
         lang = user["language"]
-        entries = self.service.history(user["id"], limit=10)
+        data = self.service.session_history(user["id"], page=page, page_size=PAGE_SIZE)
         rows = [[button(f"#{entry['id']} · {t(lang, entry['discipline'])} · {entry['answered']}/{entry['total']}",
-                        "result", entry["id"])] for entry in entries]
-        rows.append([button(t(lang, "menu"), "menu")])
-        await self.render(update, t(lang, "history_title" if entries else "empty_history"), rows)
+                        "result", entry["id"])] for entry in data["items"]]
+        rows.extend(pagination(lang, data, "sessions"))
+        rows.extend([[button(t(lang, "my_progress"), "progress")], [button(t(lang, "menu"), "menu")]])
+        text = (t(lang, "tests_page", page=data["page"] + 1, pages=data["pages"])
+                if data["items"] else t(lang, "empty_history"))
+        await self.render(update, text, rows)
+
+    async def show_answers(self, update: Update, user: dict[str, Any], scope: str, page: int) -> None:
+        lang = user["language"]
+        data = self.service.question_history(user["id"], discipline=None if scope == "ALL" else scope,
+                                             page=page, page_size=PAGE_SIZE)
+        rows = []
+        for entry in data["items"]:
+            stem = entry["snapshot"]["text"].replace("\n", " ")[:45]
+            label = f"{answer_marker(entry)} {chr(65 + entry['selected_option'])} · ×{entry['attempt_count']} · {stem}"
+            rows.append([button(label, "qa", scope, data["page"], entry["question_id"], 0)])
+        rows.extend(pagination(lang, data, "ql", scope))
+        if not data["items"]:
+            text = t(lang, "empty_answers")
+            rows.append([button(t(lang, "study_start"), "study", scope)])
+        else:
+            text = t(lang, "answered_title", subject=t(lang, scope), total=data["total"],
+                     page=data["page"] + 1, pages=data["pages"]) + "\n\n" + t(lang, "answer_legend")
+        rows.extend([[button(t(lang, "my_progress"), "progress")], [button(t(lang, "menu"), "menu")]])
+        await self.render(update, text, rows)
+
+    async def show_attempt(self, update: Update, user: dict[str, Any], scope: str,
+                           list_page: int, question_id: str, page: int) -> None:
+        lang = user["language"]
+        # One attempt per page preserves the exact question/options snapshot if
+        # a question's reviewed key or wording changed between attempts.
+        data = self.service.question_attempts(user["id"], question_id, page=page, page_size=1)
+        if not data["items"]:
+            raise LookupError("No own attempt for this question")
+        attempt = data["items"][0]
+        snapshot = attempt["snapshot"]
+        title = t(lang, "attempt_title", subject=t(lang, snapshot["discipline"]),
+                  number=data["total"] - data["page"], total=data["total"],
+                  date=str(attempt["answered_at"]).replace("T", " "))
+        if data["page"] == 0:
+            title += "\n" + t(lang, "latest_attempt")
+        selected = attempt["selected_option"]
+        choice = f"{chr(65 + selected)}. {snapshot['options'][selected]}"
+        feedback = {**attempt, "answer_status": snapshot["answer_status"],
+                    "correct_option": snapshot.get("correct_option")}
+        text = "\n\n".join([title, question_text(snapshot, lang),
+                              t(lang, "selected_answer", answer=choice), feedback_text(feedback, lang)])
+        rows = pagination(lang, data, "qa", scope, list_page, question_id,
+                          previous="newer_attempt", more="older_attempt")
+        rows.extend([[button(t(lang, "translate"), "trh", scope, list_page, question_id, data["page"])],
+                     [button(t(lang, "back"), "ql", scope, list_page)],
+                     [button(t(lang, "my_progress"), "progress")]])
+        await self.render(update, text, rows)
+
+    async def show_translation(self, update: Update, user: dict[str, Any],
+                               question: dict[str, Any], *back: object) -> None:
+        lang = user["language"]
+        links = translation_links(question)
+        rows = [[InlineKeyboardButton(t(lang, "translate_ru"), url=links["ru"])],
+                [InlineKeyboardButton(t(lang, "translate_en"), url=links["en"])],
+                [button(t(lang, "back"), *back)]]
+        await self.render(update, t(lang, "translation_note"), rows)
 
     async def show_favorites(self, update: Update, user: dict[str, Any], page: int = 0) -> None:
         lang = user["language"]
@@ -260,6 +418,13 @@ class BotUI:
             await self.show_menu(update, user)
         elif action == "quick" and not args:
             await self.show_subjects(update, lang)
+        elif action == "bank" and not args:
+            await self.show_bank(update, user)
+        elif action == "study" and len(args) == 1 and args[0] in ("ALL", *SUBJECTS):
+            await self.start_study(update, user, args[0])
+        elif action == "study_replace" and len(args) in (1, 2) and args[0] in ("ALL", *SUBJECTS):
+            await self.start_study(update, user, args[0], replace=True,
+                                  expected_session_id=int(args[1]) if len(args) == 2 else None)
         elif action == "subject" and len(args) == 1 and args[0] in SUBJECTS:
             available = next((item["count"] for item in self.service.disciplines()
                               if item["discipline"] == args[0]), 0)
@@ -267,12 +432,17 @@ class BotUI:
             rows.append([button(t(lang, "back"), "quick")])
             await self.render(update, t(lang, "count", subject=t(lang, args[0]), available=available)
                               if available else t(lang, "unavailable"), rows)
-        elif action in ("begin", "replace") and len(args) == 2 and args[0] in SUBJECTS and args[1] in ("10", "25", "50"):
+        elif (action in ("begin", "replace") and len(args) in (2, 3) and args[0] in SUBJECTS
+              and args[1] in ("10", "25", "50") and (action == "replace" or len(args) == 2)):
             active = self.service.resume_session(uid)
-            if active and action == "begin":
+            confirmed = (action == "replace" and len(args) == 3 and active
+                         and active["id"] == int(args[2]))
+            if action == "replace" and not active:
+                await self.show_menu(update, user, t(lang, "stale"))
+            elif active and not confirmed:
                 await self.render(update, t(lang, "replace", **active), [
                     [button(t(lang, "resume", **active), "continue", active["id"])],
-                    [button(t(lang, "start_new"), "replace", *args)],
+                    [button(t(lang, "start_new"), "replace", args[0], args[1], active["id"])],
                     [button(t(lang, "menu"), "menu")]])
             else:
                 session = self.service.start_session(uid, args[0], int(args[1]))
@@ -287,11 +457,7 @@ class BotUI:
                 return
             feedback = result["feedback"]
             text = t(lang, "saved_answer", answer=chr(65 + option))
-            if feedback["verified"] and feedback.get("correct_option") is not None:
-                text += "\n\n" + t(lang, "correct" if feedback["correct"] else "incorrect",
-                                     answer=chr(65 + feedback["correct_option"]), status=feedback["answer_status"])
-            else:
-                text += "\n\n" + t(lang, "unverified")
+            text += "\n\n" + feedback_text(feedback, lang)
             session = result["session"]
             finished = session["answered"] >= session["total"]
             if finished:
@@ -308,6 +474,33 @@ class BotUI:
             await self.show_question(update, user, session_id)
         elif action == "history" and not args:
             await self.show_history(update, user)
+        elif action == "progress" and not args:
+            await self.show_progress(update, user)
+        elif action == "sessions" and len(args) == 1:
+            await self.show_sessions(update, user, int(args[0]))
+        elif action == "ql" and len(args) == 2 and args[0] in ("ALL", *SUBJECTS):
+            await self.show_answers(update, user, args[0], int(args[1]))
+        elif action == "qa" and len(args) == 4 and args[0] in ("ALL", *SUBJECTS):
+            await self.show_attempt(update, user, args[0], int(args[1]), args[2], int(args[3]))
+        elif action == "trq" and len(args) == 2:
+            session_id, qid = int(args[0]), args[1]
+            question = self.service.current_question(uid, session_id)
+            if not question or question["id"] != qid:
+                raise LookupError("Question is no longer current")
+            await self.show_translation(update, user, question, "continue", session_id)
+        elif action == "trh" and len(args) == 4 and args[0] in ("ALL", *SUBJECTS):
+            scope, list_page, qid, page = args[0], int(args[1]), args[2], int(args[3])
+            data = self.service.question_attempts(uid, qid, page=page, page_size=1)
+            if not data["items"]:
+                raise LookupError("No own attempt for translation")
+            await self.show_translation(update, user, data["items"][0]["snapshot"],
+                                        "qa", scope, list_page, qid, data["page"])
+        elif action == "trf" and len(args) == 2:
+            page, qid = int(args[0]), args[1]
+            question = next((item for item in self.service.favorites(uid) if item["id"] == qid), None)
+            if question is None:
+                raise LookupError("Favorite no longer present")
+            await self.show_translation(update, user, question, "favorite", page, qid)
         elif action == "result" and len(args) == 1:
             await self.show_result(update, user, int(args[0]))
         elif action == "favorites" and len(args) == 1:
@@ -323,6 +516,7 @@ class BotUI:
             else:
                 await self.render(update, question_text(question, lang), [
                     [button(t(lang, "favorite_remove"), "remove", page, qid)],
+                    [button(t(lang, "translate"), "trf", page, qid)],
                     [button(t(lang, "back"), "favorites", page)]])
         else:
             raise ValueError("Unknown callback")

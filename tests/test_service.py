@@ -244,3 +244,187 @@ def test_create_service_honors_environment_database_url(monkeypatch, tmp_path):
     assert path.exists()
     assert restored["id"] == user["id"]
     assert restored["language"] == "ru"
+
+
+def answer_remaining(service, user_id, session_id, option=0):
+    answered = []
+    while current := service.current_question(user_id, session_id):
+        result = service.answer(user_id, session_id, current["id"], option)
+        assert result["accepted"] is True
+        answered.append(current)
+    return answered
+
+
+def test_study_covers_entire_ready_bank_once_including_final_partial_batch(service, tmp_path):
+    # IDs deliberately run opposite to page order.
+    records = [question(f"q{52 - i:02}", source_page=i + 1,
+                        discipline="anatomy" if i < 30 else "physiology") for i in range(53)]
+    import_questions(service, tmp_path, *records, question("quarantined", status="NEEDS_REVIEW"))
+    user_id = create_user(service)
+    covered, sizes = [], []
+    while session := service.start_study_session(user_id):
+        assert session["discipline"] == "ALL"
+        sizes.append(session["total"])
+        covered.extend(answer_remaining(service, user_id, session["id"]))
+    assert sizes == [25, 25, 3]
+    assert len({q["id"] for q in covered}) == 53
+    assert [q["source_page"] for q in covered] == list(range(1, 54))
+    progress = service.progress(user_id)
+    assert progress["total"] == progress["answered_unique"] == progress["total_attempts"] == 53
+    assert progress["remaining"] == progress["latest_correct"] == progress["latest_wrong"] == 0
+    assert progress["latest_unverified"] == 53
+    assert {row["discipline"]: row["answered_unique"] for row in progress["disciplines"]} == {
+        "anatomy": 30, "physiology": 23}
+
+
+def test_assignment_is_not_coverage_and_abandoned_answers_still_count(service, tmp_path):
+    import_questions(service, tmp_path, *(question(f"q{i}", source_page=i) for i in range(1, 4)))
+    user_id = create_user(service)
+    first = service.start_study_session(user_id, "ALL")
+    assert service.progress(user_id)["answered_unique"] == 0
+    assert service.progress(user_id)["remaining"] == 3
+    service.answer(user_id, first["id"], "q1", 0)
+    assert service.progress(user_id)["answered_unique"] == 1  # still ACTIVE
+    second = service.start_study_session(user_id, "anatomy")
+    assert service.get_session(user_id, first["id"])["status"] == "ABANDONED"
+    assert service.progress(user_id)["answered_unique"] == 1
+    assert second["total"] == 2
+    assert service.current_question(user_id, second["id"])["id"] == "q2"
+    assert service.question_history(user_id)["items"][0]["question_id"] == "q1"
+    assert service.answer(user_id, first["id"], "q2", 0)["accepted"] is False
+    assert [q["id"] for q in answer_remaining(service, user_id, second["id"])] == ["q2", "q3"]
+
+
+def test_repeats_keep_unique_coverage_and_use_latest_outcome(service, tmp_path):
+    import_questions(service, tmp_path,
+                     question("official", answer_status="OFFICIAL", correct_option="A"),
+                     question("reviewed", answer_status="MEDICAL_REVIEWED", correct_option="A"),
+                     question("unknown"))
+    user_id = create_user(service)
+    first = service.start_study_session(user_id)
+    answer_remaining(service, user_id, first["id"], option=0)
+    assert service.progress(user_id)["latest_correct"] == 2
+    repeated = service.start_session(user_id, "anatomy")
+    answer_remaining(service, user_id, repeated["id"], option=1)
+    progress = service.progress(user_id)
+    assert progress["total"] == progress["answered_unique"] == 3
+    assert progress["total_attempts"] == 6
+    assert progress["remaining"] == progress["latest_correct"] == 0
+    assert progress["latest_wrong"] == 2
+    assert progress["latest_unverified"] == 1
+    assert all(row["attempt_count"] == 2 for row in service.question_history(user_id)["items"])
+    attempts = service.question_attempts(user_id, "official")
+    assert attempts["total"] == 2
+    assert [(item["selected_option"], item["correct"]) for item in attempts["items"]] == [(1, False), (0, True)]
+    assert all(item["correct_option"] == 0 and item["answer_status"] == "OFFICIAL"
+               and item["answered_at"] for item in attempts["items"])
+    unknown = service.question_attempts(user_id, "unknown")["items"]
+    assert all(item["correct"] is None and item["correct_option"] is None for item in unknown)
+
+
+def test_coverage_and_question_histories_are_personal(service, tmp_path):
+    import_questions(service, tmp_path, question("q1", source_page=1), question("q2", source_page=2))
+    owner, other = create_user(service), create_user(service, 200)
+    first = service.start_study_session(owner)
+    service.answer(owner, first["id"], "q1", 0)
+    assert service.progress(owner)["answered_unique"] == 1
+    assert service.progress(other)["answered_unique"] == service.progress(other)["total_attempts"] == 0
+    assert service.question_history(other)["items"] == []
+    assert service.question_attempts(other, "q1")["items"] == []
+    second = service.start_study_session(other)
+    assert second["total"] == 2
+    assert service.current_question(other, second["id"])["id"] == "q1"
+
+
+def test_exhausted_study_does_not_close_existing_practice_session(service, tmp_path):
+    import_questions(service, tmp_path, question())
+    user_id = create_user(service)
+    session = service.start_study_session(user_id)
+    answer_remaining(service, user_id, session["id"])
+    active = service.start_session(user_id, "anatomy")
+    assert service.start_study_session(user_id, "anatomy") is None
+    assert service.start_study_session(user_id, "ALL") is None
+    assert service.resume_session(user_id)["id"] == active["id"]
+    assert service.get_session(user_id, active["id"])["status"] == "ACTIVE"
+
+
+def test_fresh_import_updates_ready_coverage_and_preserves_old_snapshot_history(service, tmp_path):
+    original = question("old", text="Historical wording", source_page=1)
+    import_questions(service, tmp_path, original)
+    user_id = create_user(service)
+    session = service.start_study_session(user_id)
+    answer_remaining(service, user_id, session["id"])
+    saved_history = service.question_attempts(user_id, "old")
+    # A reviewed extraction can remove an old question from practice without
+    # rewriting the answer, its original wording, or its session summary.
+    import_questions(service, tmp_path,
+                     question("old", text="Revised wording", status="NEEDS_REVIEW"),
+                     question("new", source_page=2))
+    progress = service.progress(user_id)
+    assert progress["total"] == progress["remaining"] == 1
+    assert progress["answered_unique"] == progress["total_attempts"] == 0
+    assert service.question_attempts(user_id, "old") == saved_history
+    assert service.question_history(user_id)["total"] == 1
+    assert service.history(user_id)[0]["answered"] == 1
+    new_session = service.start_study_session(user_id)
+    assert service.current_question(user_id, new_session["id"])["id"] == "new"
+    answer_remaining(service, user_id, new_session["id"])
+    assert service.progress(user_id)["remaining"] == 0
+
+
+def test_question_history_paginates_and_filters_snapshot_discipline(service, tmp_path):
+    import_questions(service, tmp_path, *(question(f"q{i}", source_page=i,
+                     discipline="anatomy" if i % 2 else "physiology") for i in range(7)))
+    user_id = create_user(service)
+    session = service.start_study_session(user_id)
+    answer_remaining(service, user_id, session["id"])
+    pages = [service.question_history(user_id, page=i, page_size=3) for i in range(3)]
+    assert [page["total"] for page in pages] == [7, 7, 7]
+    assert [len(page["items"]) for page in pages] == [3, 3, 1]
+    assert [item["question_id"] for page in pages for item in page["items"]] == [f"q{i}" for i in range(6, -1, -1)]
+    assert service.question_history(user_id, "anatomy")["total"] == 3
+    assert service.question_history(user_id, "physiology")["total"] == 4
+    assert service.question_history(user_id, page=99, page_size=3)["page"] == 2
+
+
+def test_attempt_and_session_history_pagination_keeps_legacy_history(service, tmp_path):
+    import_questions(service, tmp_path, question())
+    user_id = create_user(service)
+    session_ids = []
+    for option in [0, 1, 0, 1, 0]:
+        session = service.start_session(user_id, "anatomy")
+        session_ids.append(session["id"])
+        answer_remaining(service, user_id, session["id"], option)
+    first = service.question_attempts(user_id, "q1", page=0, page_size=2)
+    second = service.question_attempts(user_id, "q1", page=1, page_size=2)
+    third = service.question_attempts(user_id, "q1", page=2, page_size=2)
+    assert [len(page["items"]) for page in (first, second, third)] == [2, 2, 1]
+    assert all(page["total"] == 5 and page["pages"] == 3 for page in (first, second, third))
+    assert [item["session_id"] for page in (first, second, third) for item in page["items"]] == session_ids[::-1]
+    history = service.session_history(user_id, page_size=2)
+    assert history["items"] == service.history(user_id, limit=2)
+    assert service.session_history(user_id, page=2, page_size=2)["items"][0]["id"] == session_ids[0]
+    assert service.session_history(create_user(service, 200))["items"] == []
+
+
+def test_study_filters_discipline_and_empty_progress_is_defined(service, tmp_path):
+    user_id = create_user(service)
+    assert service.progress(user_id) == {
+        "total": 0, "answered_unique": 0, "remaining": 0, "latest_correct": 0,
+        "latest_wrong": 0, "latest_unverified": 0, "total_attempts": 0, "disciplines": []}
+    assert service.start_study_session(user_id) is None
+    import_questions(service, tmp_path, question("a", discipline="anatomy"),
+                     question("p", discipline="physiology"))
+    session = service.start_study_session(user_id, "physiology")
+    assert session["discipline"] == "physiology" and session["total"] == 1
+    assert service.current_question(user_id, session["id"])["id"] == "p"
+    for count in (0, -1, 51, True, "25"):
+        with pytest.raises(ValueError):
+            service.start_study_session(user_id, count=count)
+    for method in (service.question_history, service.session_history):
+        with pytest.raises(ValueError):
+            method(user_id, page=-1)
+    with pytest.raises(ValueError):
+        service.question_attempts(user_id, "p", page_size=0)
+    with pytest.raises(LookupError):
+        service.progress(999999)

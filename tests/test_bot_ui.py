@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from telegram import Chat, Message, Update, User
@@ -56,6 +57,36 @@ async def click(ui, data, telegram_id=123):
     return update
 
 
+def callbacks(update):
+    return [item.callback_data for row in last_render(update)[1].inline_keyboard for item in row]
+
+
+@pytest.fixture
+def study_service(service, tmp_path):
+    records = []
+    for subject, count in (("PHYSIOLOGY", 12), ("PHARMACOLOGY", 8)):
+        for index in range(count):
+            records.append({
+                "id": f"{subject[:3]}_{index}", "discipline": subject,
+                "text": f"Ερώτηση {subject} {index};", "original_text": "audit block",
+                "options": ["Επιλογή πρώτη", "Επιλογή δεύτερη"], "status": "READY",
+                "answer_status": "UNVERIFIED", "source_document": "Επίσημη πηγή.pdf",
+                "source_page": index + 2, "source_year": 2025,
+            })
+    path = tmp_path / "more.jsonl"
+    path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+    service.import_bank(path)
+    return service
+
+
+async def complete_via_ui(ui, service, uid, session_id, option=0):
+    seen = []
+    while question := service.current_question(uid, session_id):
+        seen.append(question["id"])
+        await click(ui, f"answer:{session_id}:{question['id']}:{option}")
+    return seen
+
+
 @pytest.mark.asyncio
 async def test_complete_first_run_with_unverified_result_and_history(service):
     ui = BotUI(service)
@@ -91,7 +122,11 @@ async def test_complete_first_run_with_unverified_result_and_history(service):
     assert "Тест завершён" in text and "UNVERIFIED): 10" in text
     assert "Оценка не рассчитана" in text and "%" not in text
     update = await click(ui, "history")
-    assert len(last_render(update)[1].inline_keyboard) == 2
+    assert "Уникальных вопросов отвечено: 10/10" in last_render(update)[0]
+    assert "Без проверенного ключа: 10" in last_render(update)[0]
+    assert "ql:ALL:0" in str(last_render(update)[1])
+    update = await click(ui, "sessions:0")
+    assert f"result:{session['id']}" in str(last_render(update)[1])
     assert service.history(uid)[0]["answered"] == 10
 
 
@@ -160,7 +195,7 @@ async def test_starting_new_test_requires_explicit_replacement(service):
     update = await click(ui, "begin:ANATOMY:25")
     assert "unfinished test" in last_render(update)[0]
     assert service.resume_session(uid)["id"] == first["id"]
-    await click(ui, "replace:ANATOMY:25")
+    await click(ui, f"replace:ANATOMY:25:{first['id']}")
     assert service.resume_session(uid)["id"] != first["id"]
     assert service.get_session(uid, first["id"])["status"] == "ABANDONED"
 
@@ -235,3 +270,206 @@ def test_application_builds_without_network_and_ui_translations_are_complete(ser
     assert len(application.handlers[0]) == 4
     assert application.concurrent_updates == 1
     assert all(set(TEXT[language]) == set(TEXT["en"]) for language in LANGUAGES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["ru", "en", "el"])
+async def test_study_entire_bank_in_25_question_batches_without_repeats(study_service, language):
+    service = study_service
+    uid = service.upsert_user(123, language)["id"]
+    ui = BotUI(service)
+    update = await click(ui, "menu")
+    assert "bank" in callbacks(update) and "progress" in callbacks(update)
+    update = await click(ui, "bank")
+    assert {"study:ALL", "study:ANATOMY", "study:PHYSIOLOGY", "study:PHARMACOLOGY"}.issubset(callbacks(update))
+    update = await click(ui, "study:ALL")
+    first = service.resume_session(uid)
+    assert first["discipline"] == "ALL" and first["total"] == 25
+    seen = await complete_via_ui(ui, service, uid, first["id"])
+    update = await click(ui, f"result:{first['id']}")
+    assert "study:ALL" in callbacks(update)
+    await click(ui, "study:ALL")
+    second = service.resume_session(uid)
+    assert second["total"] == 5
+    seen += await complete_via_ui(ui, service, uid, second["id"])
+    assert len(seen) == len(set(seen)) == 30
+    update = await click(ui, "progress")
+    text, _ = last_render(update)
+    assert "30/30" in text
+    progress = service.progress(uid)
+    assert progress["remaining"] == progress["latest_correct"] == progress["latest_wrong"] == 0
+    assert progress["latest_unverified"] == 30
+    update = await click(ui, "study:ALL")
+    assert service.resume_session(uid) is None
+    assert "progress" in callbacks(update)
+
+
+@pytest.mark.asyncio
+async def test_study_replacement_preserves_answered_questions_and_resume(study_service):
+    service = study_service
+    uid = service.upsert_user(123, "ru")["id"]
+    old = service.start_session(uid, "ANATOMY", 10)
+    question = service.current_question(uid, old["id"])
+    service.answer(uid, old["id"], question["id"], 0)
+    ui = BotUI(service)
+    update = await click(ui, "study:ALL")
+    assert f"continue:{old['id']}" in callbacks(update)
+    assert f"study_replace:ALL:{old['id']}" in callbacks(update)
+    assert service.resume_session(uid)["id"] == old["id"]
+    await click(ui, f"study_replace:ALL:{old['id']}")
+    new = service.resume_session(uid)
+    assert new["id"] != old["id"]
+    current = service.current_question(uid, new["id"])
+    await click(ui, f"answer:{new['id']}:{current['id']}:0")
+    ui = BotUI(service)
+    update = await click(ui, "menu")
+    assert f"continue:{new['id']}" in callbacks(update)
+    seen = [current["id"]] + await complete_via_ui(ui, service, uid, new["id"])
+    assert question["id"] not in seen
+    assert service.get_session(uid, old["id"])["status"] == "ABANDONED"
+    assert service.progress(uid)["answered_unique"] == 26
+
+
+@pytest.mark.asyncio
+async def test_empty_question_history_starts_selected_unanswered_subject(study_service):
+    uid = study_service.upsert_user(123, "ru")["id"]
+    ui = BotUI(study_service)
+    update = await click(ui, "ql:PHYSIOLOGY:0")
+    assert "ещё не отвечали" in last_render(update)[0]
+    assert "study:PHYSIOLOGY" in callbacks(update)
+    await click(ui, "study:PHYSIOLOGY")
+    session = study_service.resume_session(uid)
+    assert session["discipline"] == "PHYSIOLOGY" and session["total"] == 12
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["quick", "study"])
+async def test_replayed_replacement_confirmation_preserves_new_active_session(service, mode):
+    uid = service.upsert_user(123, "ru")["id"]
+    old = service.start_session(uid, "ANATOMY", 10)
+    ui = BotUI(service)
+    initial = "begin:ANATOMY:25" if mode == "quick" else "study:ALL"
+    confirm = f"replace:ANATOMY:25:{old['id']}" if mode == "quick" else f"study_replace:ALL:{old['id']}"
+    update = await click(ui, initial)
+    assert confirm in callbacks(update)
+    await click(ui, confirm)
+    new = service.resume_session(uid)
+    assert new["id"] != old["id"]
+    question = service.current_question(uid, new["id"])
+    service.answer(uid, new["id"], question["id"], 0)
+    update = await click(ui, confirm)
+    assert service.resume_session(uid)["id"] == new["id"]
+    assert service.resume_session(uid)["answered"] == 1
+    assert f"continue:{new['id']}" in callbacks(update)
+    # Old bot messages without an expected session ID must also reconfirm.
+    legacy = "replace:ANATOMY:25" if mode == "quick" else "study_replace:ALL"
+    await click(ui, legacy)
+    assert service.resume_session(uid)["id"] == new["id"]
+
+
+@pytest.mark.asyncio
+async def test_history_paginates_questions_attempts_and_isolates_users(service):
+    uid = service.upsert_user(123, "ru")["id"]
+    ui = BotUI(service)
+    for option in (0, 1):
+        session = service.start_session(uid, "ANATOMY", 10)
+        await complete_via_ui(ui, service, uid, session["id"], option)
+    update = await click(ui, "history")
+    assert "Уникальных вопросов отвечено: 10/10" in last_render(update)[0]
+    assert "Попыток по текущему банку: 20" in last_render(update)[0]
+    update = await click(ui, "ql:ALL:0")
+    assert "ql:ALL:1" in callbacks(update)
+    question_buttons = [item for row in last_render(update)[1].inline_keyboard for item in row
+                        if item.callback_data.startswith("qa:")]
+    assert len(question_buttons) == 8
+    assert all(item.text.startswith("? B · ×2") for item in question_buttons)
+    detail = question_buttons[0].callback_data
+    qid = detail.split(":")[3]
+    update = await click(ui, detail)
+    text, _ = last_render(update)
+    assert "Попытка 2/2" in text and "Ваш последний ответ" in text
+    assert "Вы выбрали: B. Δεύτερη" in text
+    assert "UNVERIFIED" in text and "неверный" not in text
+    older = f"qa:ALL:0:{qid}:1"
+    assert older in callbacks(update)
+    update = await click(ui, older)
+    assert "Попытка 1/2" in last_render(update)[0]
+    assert "Вы выбрали: A. Πρώτη" in last_render(update)[0]
+    assert "ql:ALL:0" in callbacks(update)
+    update = await click(ui, "ql:ALL:1")
+    assert len([item for item in callbacks(update) if item.startswith("qa:")]) == 2
+    assert "ql:ALL:0" in callbacks(update)
+    own_before = service.progress(uid)
+    foreign = await click(ui, detail, telegram_id=456)
+    assert "Ποια" not in last_render(foreign)[0]
+    other_id = service.upsert_user(456, "ru")["id"]
+    assert service.progress(other_id)["answered_unique"] == 0
+    assert service.progress(uid) == own_before
+
+
+@pytest.mark.asyncio
+async def test_session_history_goes_beyond_first_ten(service):
+    uid = service.upsert_user(123, "en")["id"]
+    for _ in range(12):
+        session = service.start_session(uid, "ANATOMY", 10)
+        service.finish_session(uid, session["id"])
+    ui = BotUI(service)
+    update = await click(ui, "sessions:0")
+    assert "sessions:1" in callbacks(update)
+    update = await click(ui, "sessions:1")
+    result_buttons = [item for item in callbacks(update) if item.startswith("result:")]
+    assert len(result_buttons) == 4 and "result:1" in result_buttons
+
+
+@pytest.mark.asyncio
+async def test_verified_history_uses_attempt_key_and_latest_progress(service, tmp_path):
+    record = {"id": "verified", "discipline": "ANATOMY", "text": "Επαληθευμένη ερώτηση;",
+              "original_text": "Επαληθευμένη ερώτηση;", "options": ["Άλφα", "Βήτα"],
+              "status": "READY", "answer_status": "MEDICAL_REVIEWED", "correct_option": 1}
+    path = tmp_path / "verified.jsonl"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    service.import_bank(path)
+    uid = service.upsert_user(123, "ru")["id"]
+    session = service.start_study_session(uid, count=25)
+    while question := service.current_question(uid, session["id"]):
+        service.answer(uid, session["id"], question["id"], 1)
+    ui = BotUI(service)
+    update = await click(ui, "progress")
+    assert "Правильно (проверено): 1" in last_render(update)[0]
+    assert "Без проверенного ключа: 10" in last_render(update)[0]
+    update = await click(ui, "qa:ALL:0:verified:0")
+    assert "Верно. Проверенный ответ: B (MEDICAL_REVIEWED)" in last_render(update)[0]
+
+
+@pytest.mark.asyncio
+async def test_translation_active_history_and_favorites_preserve_progress(service):
+    uid = service.upsert_user(123, "ru")["id"]
+    session = service.start_session(uid, "ANATOMY", 10)
+    question = service.current_question(uid, session["id"])
+    qid = question["id"]
+    service.toggle_favorite(uid, qid)
+    ui = BotUI(service)
+    before = service.get_session(uid, session["id"])
+    update = await click(ui, f"trq:{session['id']}:{qid}")
+    text, keyboard = last_render(update)
+    assert "Google Translate" in text and "машинный перевод" in text
+    for index, language in enumerate(("ru", "en")):
+        url = keyboard.inline_keyboard[index][0].url
+        values = parse_qs(urlparse(url).query)
+        assert values["tl"] == [language]
+        assert question["text"] in values["text"][0]
+        assert "A. Πρώτη" in values["text"][0] and "B. Δεύτερη" in values["text"][0]
+    assert service.get_session(uid, session["id"]) == before
+    assert f"continue:{session['id']}" in callbacks(update)
+    update = await click(ui, f"trf:0:{qid}")
+    assert f"favorite:0:{qid}" in callbacks(update)
+    service.answer(uid, session["id"], qid, 1)
+    before = service.progress(uid)
+    update = await click(ui, f"trh:ALL:0:{qid}:0")
+    assert f"qa:ALL:0:{qid}:0" in callbacks(update)
+    assert service.progress(uid) == before
+    update = await click(ui, f"trq:{session['id']}:{qid}")
+    assert "устарела" in last_render(update)[0]
+    for payload in (f"trq:{session['id']}:{qid}", f"trh:ALL:0:{qid}:0", f"trf:0:{qid}"):
+        update = await click(ui, payload, telegram_id=456)
+        assert not any(item.url for row in last_render(update)[1].inline_keyboard for item in row)
